@@ -1,48 +1,41 @@
 package app
 
 import (
+	"cj_service/internal/config"
+	"cj_service/internal/handler/shedulers"
+	tables_h "cj_service/internal/handler/tables"
+	tables_r "cj_service/internal/repository/tables"
+	tables_s "cj_service/internal/service/tables"
+	"cj_service/internal/tg_handlers"
 	"context"
+	"github.com/andReyM228/lib/gpt3"
+	"github.com/jasonlvhit/gocron"
+	"github.com/jmoiron/sqlx"
+	"gopkg.in/telebot.v3"
 	stdLog "log"
 	"net/http"
 	"os"
-	"strings"
-
-	"cj_service/internal/config"
-	"cj_service/internal/domain"
-	car_handler "cj_service/internal/handler/car"
-	user_handler "cj_service/internal/handler/user"
-	"cj_service/internal/repository/cars"
-	"cj_service/internal/repository/user"
-	"cj_service/internal/service/car"
-	user_service "cj_service/internal/service/user"
-	"cj_service/internal/tg_handlers"
 
 	"github.com/andReyM228/lib/errs"
-	"github.com/andReyM228/lib/gpt3"
 	"github.com/andReyM228/lib/log"
 	"github.com/go-playground/validator/v10"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 type App struct {
-	config                      config.Config
-	serviceName                 string
-	tgbot                       *tgbotapi.BotAPI
-	logger                      log.Logger
-	validator                   *validator.Validate
-	usersRepo                   user.Repository
-	carsRepo                    cars.Repository
-	userService                 user_service.Service
-	carService                  car.Service
-	userHandler                 user_handler.Handler
-	carHandler                  car_handler.Handler
-	tgHandler                   tg_handlers.Handler
-	clientHTTP                  *http.Client
-	errChan                     chan errs.TgError
-	loginUsers                  map[int64]string
-	chatGPT                     gpt3.ChatGPT
-	processingRegistrationUsers domain.ProcessingRegistrationUsers
-	processingLoginUsers        domain.ProcessingLoginUsers
+	config           config.Config
+	serviceName      string
+	tgbot            *telebot.Bot
+	logger           log.Logger
+	validator        *validator.Validate
+	tablesRepo       tables_r.Repository
+	tablesService    tables_s.Service
+	tablesHandler    tables_h.Handler
+	tgHandler        tg_handlers.Handler
+	schedulerHandler shedulers.Handler
+	clientHTTP       *http.Client
+	errChan          chan errs.TgError
+	chatGPT          gpt3.ChatGPT
+	db               *sqlx.DB
 }
 
 func New(name string) App {
@@ -51,22 +44,18 @@ func New(name string) App {
 	}
 }
 
-func (a *App) initGPT() {
-	a.chatGPT = gpt3.Init(a.config.ChatGPT.Key, a.config.ChatGPT.Model)
-}
-
 func (a *App) Run(ctx context.Context) {
 	a.initValidator()
 	a.populateConfig()
 	a.initLogger()
-	a.initGPT()
 	a.listenErrs(ctx)
 	a.initTgBot()
 	a.initHTTPClient()
 	a.initRepos()
 	a.initServices()
 	a.initHandlers()
-	a.listenTgBot()
+	go a.runShedulers(ctx)
+	a.listenTgHandlers()
 }
 
 func (a *App) listenErrs(ctx context.Context) {
@@ -77,7 +66,7 @@ func (a *App) listenErrs(ctx context.Context) {
 			select {
 			case err := <-a.errChan:
 				go func(err errs.TgError) {
-					errs.HandleError(err.Err, a.logger, a.tgbot, err.ChatID)
+					errs.HandleError(err.Err, a.logger, nil, err.ChatID)
 				}(err)
 			case <-ctx.Done():
 				a.logger.Debug("ctx is done")
@@ -88,99 +77,45 @@ func (a *App) listenErrs(ctx context.Context) {
 	}()
 }
 
+func (a *App) listenTgHandlers() {
+	a.tgbot.Handle("/start", a.tgHandler.StartHandler)
+
+	a.tgbot.Handle("информацияℹ️", a.tgHandler.InfoHandler)
+
+	a.tgbot.Handle("вопросы❔", a.tgHandler.GetAllQuestionsHandler)
+
+	a.tgbot.Handle("расписание📅", a.tgHandler.Schedule)
+
+	a.tgbot.Handle(telebot.OnText, a.tgHandler.GetStudentHandler)
+
+	a.logger.Debug("started tg handlers")
+
+	a.tgbot.Start()
+}
+
+func (a *App) runShedulers(ctx context.Context) error {
+	err := gocron.Every(5).Minutes().Do(a.schedulerHandler.GetInfo)
+	if err != nil {
+		return err
+	}
+
+	<-gocron.Start()
+
+	return nil
+}
+
 func (a *App) initTgBot() {
 	var err error
-	a.tgbot, err = tgbotapi.NewBotAPI(a.config.TgBot.Token)
+	bot, err := telebot.NewBot(telebot.Settings{
+		Token:     a.config.TgBot.Token,
+		Poller:    &telebot.LongPoller{Timeout: 10 * 60},
+		ParseMode: telebot.ModeMarkdownV2,
+	})
 	if err != nil {
-		a.errChan <- errs.TgError{
-			Err: err,
-		}
 		return
 	}
 
-}
-
-func (a *App) listenTgBot() {
-	updateConfig := tgbotapi.NewUpdate(0)
-	updateConfig.Timeout = 1
-	updates := a.tgbot.GetUpdatesChan(updateConfig)
-
-	a.logger.Debug("tg_bot api started")
-
-	for update := range updates {
-		if update.Message != nil {
-			if a.processingRegistrationUsers.IfExists(update.Message.Chat.ID) {
-				go a.tgHandler.RegistrationHandler(update)
-
-				continue
-			}
-
-			if a.processingLoginUsers.IfExists(update.Message.Chat.ID) {
-				go a.tgHandler.LoginHandler(update)
-
-				continue
-			}
-		}
-		if update.Message == nil {
-			if update.CallbackQuery != nil {
-				switch {
-				case strings.Contains(update.CallbackQuery.Data, "buy_data"):
-					go a.tgHandler.BuyDataButton(update)
-					continue
-
-				case strings.Contains(update.CallbackQuery.Data, "sell_data"):
-					go a.tgHandler.SellDataButton(update)
-					continue
-
-				case strings.Contains(update.CallbackQuery.Data, "view_data"):
-					go a.tgHandler.ViewDataButton(update)
-					continue
-
-				case strings.Contains(update.CallbackQuery.Data, "characteristics_data"):
-					go a.tgHandler.CharacteristicsDataButton(update)
-					continue
-
-				case strings.Contains(update.CallbackQuery.Data, "all_car_data"):
-					go a.tgHandler.AllCarDataButton(update, a.loginUsers)
-					continue
-
-				}
-			}
-
-			continue
-		}
-
-		switch {
-		case strings.Contains(update.Message.Text, "/start"):
-			go a.tgHandler.StartHandler(update)
-			continue
-
-		case strings.Contains(update.Message.Text, "/get-car"):
-			go a.tgHandler.GetCarHandler(update, a.loginUsers)
-			continue
-
-		case strings.Contains(update.Message.Text, "/all-cars"):
-			go a.tgHandler.AllCarsHandler(update)
-			continue
-
-		case strings.Contains(update.Message.Text, "/get-user"):
-			go a.tgHandler.GetUserHandler(update)
-			continue
-
-		case strings.Contains(update.Message.Text, "/get-my-cars"):
-			go a.tgHandler.GetMyCarsHandler(update, a.loginUsers)
-			continue
-
-		case strings.Contains(update.Message.Text, "/registration"):
-			go a.tgHandler.RegistrationHandler(update)
-			continue
-
-		case strings.Contains(update.Message.Text, "/login"):
-			go a.tgHandler.LoginHandler(update)
-			continue
-
-		}
-	}
+	a.tgbot = bot
 }
 
 func (a *App) initLogger() {
@@ -192,24 +127,21 @@ func (a *App) initValidator() {
 }
 
 func (a *App) initRepos() {
-	a.carsRepo = cars.NewRepository(a.logger, a.clientHTTP)
-	a.usersRepo = user.NewRepository(a.logger, a.clientHTTP)
+	a.tablesRepo = tables_r.NewRepository(a.logger, a.clientHTTP, a.config.Extra)
 
 	a.logger.Debug("repos created")
 }
 
 func (a *App) initServices() {
-	a.carService = car.NewService(a.carsRepo, a.logger)
-	a.userService = user_service.NewService(a.usersRepo, a.logger)
+	a.tablesService = tables_s.NewService(a.logger, a.tablesRepo)
 
 	a.logger.Debug("services created")
 }
 
 func (a *App) initHandlers() {
-	a.loginUsers = map[int64]string{}
-	a.carHandler = car_handler.NewHandler(a.carService, a.tgbot)
-	a.userHandler = user_handler.NewHandler(a.userService, a.tgbot, a.loginUsers, &a.processingRegistrationUsers, &a.processingLoginUsers)
-	a.tgHandler = tg_handlers.NewHandler(a.tgbot, a.userHandler, a.carHandler, a.errChan, a.chatGPT)
+	a.tablesHandler = tables_h.NewHandler(a.tablesService, a.tgbot)
+	a.tgHandler = tg_handlers.NewHandler(a.tgbot, a.tablesHandler, a.errChan)
+	a.schedulerHandler = shedulers.NewHandler(a.errChan, a.tablesService)
 
 	a.logger.Debug("handlers created")
 }

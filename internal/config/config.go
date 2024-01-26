@@ -8,17 +8,23 @@ import (
 
 type (
 	Config struct {
-		TgBot   TgBot   `yaml:"tg-bot" validate:"required"`
-		ChatGPT ChatGPT `yaml:"chat-gpt" validate:"required"`
+		TgBot TgBot `yaml:"tg-bot" validate:"required"`
+		Extra Extra `yaml:"extra" validate:"required"`
 	}
 
 	TgBot struct {
 		Token string `yaml:"token" validate:"required"`
 	}
 
-	ChatGPT struct {
-		Key   string `yaml:"key" validate:"required"`
-		Model string `yaml:"model" validate:"required"`
+	GoogleSheets struct {
+		UrlNames        string `yaml:"urlNames" validate:"required"`
+		UrlQuestions    string `yaml:"urlQuestions" validate:"required"`
+		UrlAllQuestions string `yaml:"urlAllQuestions" validate:"required"`
+		UrlInfo         string `yaml:"urlInfo" validate:"required"`
+	}
+
+	Extra struct {
+		GoogleSheets GoogleSheets `yaml:"google-sheets" validate:"required"`
 	}
 )
 

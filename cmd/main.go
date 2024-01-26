@@ -7,12 +7,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	"tg_service/internal/app"
+	"cj_service/internal/app"
 
 	_ "github.com/lib/pq"
 )
 
-const serviceName = "tg_service"
+const serviceName = "cj_service"
 
 func main() {
 	a := app.New(serviceName)
